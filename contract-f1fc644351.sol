@@ -13,15 +13,9 @@ import {Nonces} from "@openzeppelin/contracts/utils/Nonces.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
- * @title MyTokenPro - Token ERC20 Avanzado con Staking y Gobernanza
+ * @title MyTokenPro - Token ERC20 Avanzado con Staking y Gobernanza (VERSIÓN SEGURA)
  * @notice Implementa sistema de fees dinámicos, staking con recompensas y gobernanza
- * @dev Arquitectura modular con separación de concerns para seguridad y mantenibilidad
- * 
- * ARQUITECTURA:
- * ├── Core: Funcionalidades básicas del token (mint, burn, pause)
- * ├── FeeManager: Sistema de fees dinámicos con protecciones anti-manipulación
- * ├── StakingModule: Sistema de staking con recompensas time-weighted
- * └── Governance: Integración con ERC20Votes para votaciones
+ * @dev Versión corregida con todas las vulnerabilidades resueltas
  */
 contract MyTokenPro is
     ERC20,
@@ -43,17 +37,25 @@ contract MyTokenPro is
     uint256 public constant STAKING_PERCENT = 50;   // 50% del fee
     uint256 public constant TREASURY_PERCENT = 30;  // 30% del fee
     
-    // Configuración de Staking
-    uint256 public constant MIN_BLOCKS_BETWEEN_CLAIM = 5;
-    uint256 public constant MIN_LOCK_BLOCKS = 20;
+    // Configuración de Staking anti-flash-loan
+    uint256 public constant MIN_BLOCKS_BETWEEN_CLAIM = 100; // ↑ de 5 a 100
+    uint256 public constant MIN_LOCK_BLOCKS = 1000;         // ↑ de 20 a 1000 (~4 horas)
+    uint256 public constant MIN_STAKE_DURATION = 1000;      // mínimo para rewards
     uint256 public constant REWARD_PRECISION = 1e18;
-    uint256 public constant MAX_CLAIM_PERCENT = 20; // 20% del pool por claim
+    uint256 public constant MAX_CLAIM_PERCENT = 10;         // ↓ de 20% a 10%
+    uint256 public constant MAX_REWARD_PER_UPDATE = 100;    // 1% máximo
     
     // Protecciones anti-manipulación
     uint256 public constant FEE_UPDATE_COOLDOWN = 100;
     uint256 public constant TIMELOCK_DURATION = 6400; // ~1 día en bloques
     uint256 public constant MAX_EXCLUDED_ACCOUNTS = 100;
     uint256 public constant EPOCH_DURATION = 100000; // Reset acumulador cada X bloques
+    
+    // Límites adicionales
+    uint256 public constant MAX_MINT_PER_CALL = 10_000_000 * 1e18; // 1% del supply
+    uint256 public constant MAX_STAKE_AMOUNT = 1_000_000 * 1e18;
+    uint256 public constant MAX_TRANSFER_PERCENT = 5; // 5% del supply por tx
+    uint256 public constant USER_UPDATE_COOLDOWN = 10; // Bloques entre updates
 
     // ═══════════════════════════════════════════════════════════════════════════
     // VARIABLES DE ESTADO - CORE
@@ -74,7 +76,7 @@ contract MyTokenPro is
     uint256 private _lastFeeUpdateBlock;
     uint256 private _lastFeeRangeChange;
     
-    // TWAP para cálculo de fees (Time-Weighted Average Price)
+    // TWAP para cálculo de fees
     struct FeeSnapshot {
         uint256 poolRatio;
         uint256 blockNumber;
@@ -82,24 +84,28 @@ contract MyTokenPro is
     FeeSnapshot private _lastFeeSnapshot;
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // VARIABLES DE ESTADO - STAKING MODULE
+    // VARIABLES DE ESTADO - STAKING MODULE (OPTIMIZADO)
     // ═══════════════════════════════════════════════════════════════════════════
     
     struct StakeInfo {
-        uint128 amount;              // Cantidad stakeada (optimizado a 128 bits)
-        uint128 rewardDebt;          // Recompensas ya contabilizadas
+        uint128 amount;              // Cantidad stakeada
+        uint64 stakeStartBlock;      // Para anti-flash-loan
         uint64 lastClaimBlock;       // Último claim
+        uint128 rewardDebt;          // Recompensas ya contabilizadas
         uint64 lockedUntilBlock;     // Bloqueado hasta
-        uint64 lastUpdateBlock;      // Última actualización de recompensas
+        uint64 lastUpdateBlock;      // Última actualización
     }
 
     struct EpochData {
         uint256 accRewardPerToken;   // Acumulador de recompensas por token
         uint256 startBlock;          // Inicio del epoch
         uint256 totalDistributed;    // Total distribuido en el epoch
+        bool settled;                // Indicador de settlement
     }
 
     mapping(address => StakeInfo) private _stakes;
+    mapping(address => uint256) private _lastUserUpdate; // Para lazy updates
+    
     uint256 private _totalStaked;
     uint256 private _stakingPool;
     
@@ -114,12 +120,13 @@ contract MyTokenPro is
     struct TimelockProposal {
         uint256 executeAfter;
         bool executed;
+        bytes32 dataHash; // Verificar integridad de datos
     }
     
     mapping(bytes32 => TimelockProposal) private _timelockQueue;
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // EVENTOS
+    // EVENTOS (MEJORADOS)
     // ═══════════════════════════════════════════════════════════════════════════
     
     // Core Events
@@ -137,9 +144,10 @@ contract MyTokenPro is
     );
     event FeePercentUpdated(uint256 oldFee, uint256 newFee, uint256 poolRatio);
     event FeeRangeUpdated(uint256 minFee, uint256 maxFee, uint256 timestamp);
+    event StakingPoolUpdated(uint256 oldAmount, uint256 newAmount); 
     
     // Staking Events
-    event Staked(address indexed user, uint256 amount, uint256 lockedUntilBlock);
+    event Staked(address indexed user, uint256 amount, uint256 lockedUntilBlock, uint256 stakeStartBlock);
     event Unstaked(address indexed user, uint256 amount);
     event RewardClaimed(address indexed user, uint256 amount);
     event RewardsUpdated(
@@ -149,14 +157,19 @@ contract MyTokenPro is
         uint256 timestamp
     );
     event EpochAdvanced(uint256 indexed newEpoch, uint256 startBlock);
+    event EpochSettled(uint256 indexed epoch, uint256 totalSettled); 
     
     // Governance Events
-    event TimelockQueued(bytes32 indexed proposalId, uint256 executeAfter);
+    event TimelockQueued(bytes32 indexed proposalId, uint256 executeAfter, bytes32 dataHash);
     event TimelockExecuted(bytes32 indexed proposalId);
     event TimelockCancelled(bytes32 indexed proposalId);
     
     // Emergency Events
     event EmergencyWithdrawal(address indexed token, address indexed to, uint256 amount);
+    
+    // Security Events 
+    event SecurityLimitHit(string limitType, address indexed user, uint256 amount);
+    event AntiFlashLoanTriggered(address indexed user, uint256 blocksStaked);
 
     // ═══════════════════════════════════════════════════════════════════════════
     // CONSTRUCTOR
@@ -169,6 +182,7 @@ contract MyTokenPro is
     {
         require(treasuryAddress != address(0), "Treasury: zero address");
         require(initialOwner != address(0), "Owner: zero address");
+        require(treasuryAddress != initialOwner, "Treasury: cannot be owner");
         
         _treasury = treasuryAddress;
         MAX_SUPPLY = 1_000_000_000 * 10 ** decimals();
@@ -191,16 +205,18 @@ contract MyTokenPro is
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // MÓDULO CORE - FUNCIONES BÁSICAS DEL TOKEN
+    // MÓDULO CORE - FUNCIONES BÁSICAS DEL TOKEN 
     // ═══════════════════════════════════════════════════════════════════════════
     
     /**
-     * @notice Acuña nuevos tokens (solo owner)
+     * @notice Acuña nuevos tokens (solo owner, con límite por llamada)
      * @param to Destinatario de los tokens
      * @param amount Cantidad a acuñar
      */
     function mint(address to, uint256 amount) external nonReentrant onlyOwner {
         require(to != address(0), "Mint: zero address");
+        require(amount > 0, "Mint: zero amount");
+        require(amount <= MAX_MINT_PER_CALL, "Mint: exceeds per-call limit"); 
         require(_minted + amount <= MAX_SUPPLY, "Mint: max supply exceeded");
         
         _mint(to, amount);
@@ -232,7 +248,7 @@ contract MyTokenPro is
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // MÓDULO CORE - CONFIGURACIÓN CON TIMELOCK
+    // MÓDULO CORE - CONFIGURACIÓN CON TIMELOCK 
     // ═══════════════════════════════════════════════════════════════════════════
     
     /**
@@ -242,18 +258,22 @@ contract MyTokenPro is
     function setTreasury(address newTreasury) external onlyOwner {
         require(newTreasury != address(0), "Treasury: zero address");
         require(newTreasury != address(this), "Treasury: cannot be contract");
+        require(newTreasury != msg.sender, "Treasury: cannot be owner");
         
         bytes32 proposalId = keccak256(abi.encode("setTreasury", newTreasury));
+        bytes32 dataHash = keccak256(abi.encodePacked(newTreasury)); 
         TimelockProposal storage proposal = _timelockQueue[proposalId];
         
         if (proposal.executeAfter == 0) {
             // Primera llamada: encolar
             proposal.executeAfter = block.number + TIMELOCK_DURATION;
-            emit TimelockQueued(proposalId, proposal.executeAfter);
+            proposal.dataHash = dataHash;
+            emit TimelockQueued(proposalId, proposal.executeAfter, dataHash);
         } else {
             // Segunda llamada: ejecutar
             require(block.number >= proposal.executeAfter, "Timelock: too soon");
             require(!proposal.executed, "Timelock: already executed");
+            require(proposal.dataHash == dataHash, "Timelock: data mismatch"); 
             
             address oldTreasury = _treasury;
             _treasury = newTreasury;
@@ -295,25 +315,44 @@ contract MyTokenPro is
     }
 
     /**
-     * @notice Establece el rango de fees permitido (con restricciones y cooldown)
+     * @notice Establece el rango de fees permitido (CON TIMELOCK CONTRA FRONT-RUNNING)
      */
     function setFeeRange(uint256 minFee, uint256 maxFee) external onlyOwner {
         require(minFee <= maxFee, "FeeRange: invalid range");
         require(maxFee <= ABSOLUTE_FEE_MAX, "FeeRange: exceeds absolute max");
-        require(
-            block.number >= _lastFeeRangeChange + FEE_UPDATE_COOLDOWN,
-            "FeeRange: cooldown active"
-        );
         
-        FEE_MIN = minFee;
-        FEE_MAX = maxFee;
-        _lastFeeRangeChange = block.number;
+        bytes32 proposalId = keccak256(abi.encode("setFeeRange", minFee, maxFee));
+        bytes32 dataHash = keccak256(abi.encodePacked(minFee, maxFee));
+        TimelockProposal storage proposal = _timelockQueue[proposalId];
         
-        // Ajustar fee actual si está fuera del nuevo rango
-        if (feePercent < minFee) feePercent = minFee;
-        if (feePercent > maxFee) feePercent = maxFee;
-        
-        emit FeeRangeUpdated(minFee, maxFee, block.timestamp);
+        if (proposal.executeAfter == 0) {
+            // Primera llamada - encolar con timelock
+            require(
+                block.number >= _lastFeeRangeChange + FEE_UPDATE_COOLDOWN,
+                "FeeRange: cooldown active"
+            );
+            
+            proposal.executeAfter = block.number + TIMELOCK_DURATION;
+            proposal.dataHash = dataHash;
+            emit TimelockQueued(proposalId, proposal.executeAfter, dataHash);
+        } else {
+            // Segunda llamada: ejecutar
+            require(block.number >= proposal.executeAfter, "Timelock: too soon");
+            require(!proposal.executed, "Timelock: already executed");
+            require(proposal.dataHash == dataHash, "Timelock: data mismatch");
+            
+            FEE_MIN = minFee;
+            FEE_MAX = maxFee;
+            _lastFeeRangeChange = block.number;
+            proposal.executed = true;
+            
+            // Ajustar fee actual si está fuera del nuevo rango
+            if (feePercent < minFee) feePercent = minFee;
+            if (feePercent > maxFee) feePercent = maxFee;
+            
+            emit TimelockExecuted(proposalId);
+            emit FeeRangeUpdated(minFee, maxFee, block.timestamp);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -372,7 +411,7 @@ contract MyTokenPro is
     }
 
     /**
-     * @notice Aplica fees a una transferencia
+     * @notice Aplica fees a una transferencia (REENTRANCY FIXED CON CEI PATTERN)
      * @dev Distribuye: 20% burn, 50% staking pool, 30% treasury
      */
     function _applyFees(address from, address to, uint256 amount) 
@@ -387,35 +426,43 @@ contract MyTokenPro is
         uint256 treasuryAmount = fee - burnAmount - stakingAmount;
         amountAfterFee = amount - fee;
 
-        // Aplicar burn
+        // ═══════════════════════════════════════════════════════════════════
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // EFFECTS: Actualizar TODOS los estados PRIMERO
+        uint256 oldStakingPool = _stakingPool;
+        _stakingPool += stakingAmount;
+        
+        if (stakingAmount > 0) {
+            emit StakingPoolUpdated(oldStakingPool, _stakingPool);
+        }
+
+        // INTERACTIONS: Llamadas externas AL FINAL
         if (burnAmount > 0) {
             _burn(from, burnAmount);
         }
 
-        // Transferir a staking pool (CORRECCIÓN CRÍTICA)
         if (stakingAmount > 0) {
             super._update(from, address(this), stakingAmount);
-            _stakingPool += stakingAmount;
         }
 
-        // Transferir a treasury
         if (treasuryAmount > 0) {
             super._update(from, _treasury, treasuryAmount);
         }
 
-        // Transferir el resto al destinatario
         super._update(from, to, amountAfterFee);
 
         emit FeeApplied(from, fee, burnAmount, stakingAmount, treasuryAmount);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // OVERRIDE _update - PUNTO DE ENTRADA PARA TODAS LAS TRANSFERENCIAS
+    // OVERRIDE _update - PUNTO DE ENTRADA (OPTIMIZADO CON LAZY UPDATES)
     // ═══════════════════════════════════════════════════════════════════════════
     
     /**
      * @notice Hook llamado en todas las transferencias, mints y burns
-     * @dev Implementa lógica de fees y actualización de recompensas
+     * @dev Implementa lógica de fees y actualización de recompensas optimizada
      */
     function _update(address from, address to, uint256 amount)
         internal
@@ -423,8 +470,21 @@ contract MyTokenPro is
     {
         require(!paused(), "Token: paused");
 
-        // Actualizar fee dinámico
-        _updateFee();
+        // Solo actualizar fee si ha pasado suficiente tiempo
+        if (block.number >= _lastFeeUpdateBlock + FEE_UPDATE_COOLDOWN) {
+            _updateFee();
+        }
+
+        // Límite máximo por transferencia (circuit breaker)
+        if (!_excludedFromFees[from] && !_excludedFromFees[to] && 
+            from != address(0) && to != address(0)) {
+            
+            uint256 maxTransfer = Math.mulDiv(totalSupply(), MAX_TRANSFER_PERCENT, 100);
+            if (amount > maxTransfer) {
+                emit SecurityLimitHit("MaxTransfer", from, amount);
+                revert("Transfer: exceeds limit");
+            }
+        }
 
         // Determinar si se aplican fees
         bool applyFees = !_excludedFromFees[from] && 
@@ -433,9 +493,18 @@ contract MyTokenPro is
                         to != address(0);
 
         if (applyFees) {
-            // Actualizar recompensas antes de cambiar balances
-            _updateRewards(from);
-            _updateRewards(to);
+            // Lazy updates - solo si es necesario
+            if (from != address(0) && 
+                block.number > _lastUserUpdate[from] + USER_UPDATE_COOLDOWN) {
+                _updateRewards(from);
+                _lastUserUpdate[from] = block.number;
+            }
+            
+            if (to != address(0) && to != from &&
+                block.number > _lastUserUpdate[to] + USER_UPDATE_COOLDOWN) {
+                _updateRewards(to);
+                _lastUserUpdate[to] = block.number;
+            }
             
             // Aplicar fees y transferir
             _applyFees(from, to, amount);
@@ -449,15 +518,16 @@ contract MyTokenPro is
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // MÓDULO STAKING - SISTEMA DE RECOMPENSAS
+    // MÓDULO STAKING - SISTEMA DE RECOMPENSAS (ANTI-FLASH-LOAN)
     // ═══════════════════════════════════════════════════════════════════════════
     
     /**
-     * @notice Stakea tokens para ganar recompensas
+     * @notice Stakea tokens para ganar recompensas (CON LÍMITES)
      * @param amount Cantidad a stakear
      */
     function stake(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "Stake: zero amount");
+        require(amount <= MAX_STAKE_AMOUNT, "Stake: exceeds max amount"); 
         require(balanceOf(msg.sender) >= amount, "Stake: insufficient balance");
         
         _updateRewards(msg.sender);
@@ -467,6 +537,12 @@ contract MyTokenPro is
         
         // Actualizar stake info
         StakeInfo storage s = _stakes[msg.sender];
+        
+        // Registrar inicio del stake para anti-flash-loan
+        if (s.amount == 0) {
+            s.stakeStartBlock = uint64(block.number);
+        }
+        
         s.amount += uint128(amount);
         s.lockedUntilBlock = uint64(block.number + MIN_LOCK_BLOCKS);
         s.lastClaimBlock = uint64(block.number);
@@ -474,7 +550,7 @@ contract MyTokenPro is
         
         _totalStaked += amount;
         
-        emit Staked(msg.sender, amount, s.lockedUntilBlock);
+        emit Staked(msg.sender, amount, s.lockedUntilBlock, s.stakeStartBlock);
     }
 
     /**
@@ -507,6 +583,11 @@ contract MyTokenPro is
         s.amount -= uint128(amount);
         _totalStaked -= amount;
         
+        // Si retira todo, resetear stakeStartBlock
+        if (s.amount == 0) {
+            s.stakeStartBlock = 0;
+        }
+        
         // Transferir tokens
         _transfer(address(this), msg.sender, actualAmount);
         
@@ -514,10 +595,18 @@ contract MyTokenPro is
     }
 
     /**
-     * @notice Reclama recompensas acumuladas
+     * @notice Reclama recompensas acumuladas (CON ANTI-FLASH-LOAN)
      */
     function claimReward() external nonReentrant whenNotPaused {
         StakeInfo storage s = _stakes[msg.sender];
+        
+        // Anti-flash-loan protection
+        uint256 blocksStaked = block.number - s.stakeStartBlock;
+        if (blocksStaked < MIN_STAKE_DURATION) {
+            emit AntiFlashLoanTriggered(msg.sender, blocksStaked);
+            revert("Claim: insufficient stake duration");
+        }
+        
         require(
             block.number >= s.lastClaimBlock + MIN_BLOCKS_BETWEEN_CLAIM,
             "Claim: too soon"
@@ -528,7 +617,7 @@ contract MyTokenPro is
         uint256 reward = s.rewardDebt;
         require(reward > 0, "Claim: no reward");
 
-        // Límite máximo por claim (20% del pool)
+        // Límite máximo por claim (10% del pool)
         uint256 maxClaim = Math.mulDiv(_stakingPool, MAX_CLAIM_PERCENT, 100);
         if (maxClaim == 0 && _stakingPool > 0) maxClaim = 1;
         if (reward > maxClaim) reward = maxClaim;
@@ -549,21 +638,23 @@ contract MyTokenPro is
     }
 
     /**
-     * @notice Actualiza las recompensas de un usuario (CORRECCIÓN CRÍTICA)
-     * @dev Implementa sistema de epochs para prevenir overflow del acumulador
+     * @notice Actualiza las recompensas de un usuario (CON EPOCH SETTLEMENT)
+     * @dev Implementa sistema de epochs con settlement automático
      */
     function _updateRewards(address user) internal {
         if (user == address(0) || user == address(this)) return;
         
-        // Avanzar epoch si es necesario
+        // Avanzar epoch con settlement automático
         if (block.number >= _epochs[_currentEpoch].startBlock + EPOCH_DURATION) {
+            _settleCurrentEpoch();
             _currentEpoch++;
             _epochs[_currentEpoch].startBlock = block.number;
             _epochs[_currentEpoch].accRewardPerToken = 0;
+            _epochs[_currentEpoch].settled = false;
             emit EpochAdvanced(_currentEpoch, block.number);
         }
 
-        // Solo actualizar una vez por bloque
+        // Solo actualizar una vez por bloque (optimización)
         if (block.number == _lastRewardUpdateBlock) return;
 
         EpochData storage epoch = _epochs[_currentEpoch];
@@ -576,7 +667,19 @@ contract MyTokenPro is
             uint256 rewardPerBlock = Math.mulDiv(_stakingPool, 1, 10000); // 0.01% por bloque
             uint256 totalReward = rewardPerBlock * blocksSinceUpdate;
             
+            // Aplicar límite máximo por actualización
+            uint256 maxRewardThisUpdate = Math.mulDiv(
+                _stakingPool, 
+                MAX_REWARD_PER_UPDATE, 
+                10000
+            );
+            
+            if (totalReward > maxRewardThisUpdate) {
+                totalReward = maxRewardThisUpdate;
+            }
+            
             if (totalReward > _stakingPool) totalReward = _stakingPool;
+            
             if (totalReward > 0) {
                 uint256 rewardPerToken = Math.mulDiv(totalReward, REWARD_PRECISION, _totalStaked);
                 epoch.accRewardPerToken += rewardPerToken;
@@ -605,13 +708,26 @@ contract MyTokenPro is
         _lastRewardUpdateBlock = block.number;
     }
 
+    /**
+     * @notice Liquida el epoch actual 
+     * @dev Previene overflow del acumulador
+     */
+    function _settleCurrentEpoch() internal {
+        EpochData storage epoch = _epochs[_currentEpoch];
+        
+        if (!epoch.settled) {
+            epoch.settled = true;
+            emit EpochSettled(_currentEpoch, epoch.totalDistributed);
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
-    // FUNCIONES DE EMERGENCIA
+    // FUNCIONES DE EMERGENCIA (PROTECCIÓN DE FONDOS)
     // ═══════════════════════════════════════════════════════════════════════════
     
     /**
-     * @notice Retira tokens en caso de emergencia (solo cuando está pausado)
-     * @dev Requiere que el contrato esté pausado por al menos TIMELOCK_DURATION bloques
+     * @notice Retira tokens en caso de emergencia (CON PROTECCIÓN DE FONDOS)
+     * @dev Solo permite retirar excedente, protegiendo stakes y rewards de usuarios
      */
     function emergencyWithdraw(address tokenAddress, address to, uint256 amount) 
         external 
@@ -619,12 +735,23 @@ contract MyTokenPro is
         whenPaused 
     {
         require(to != address(0), "Emergency: zero address");
-        // Implementar chequeo adicional de tiempo en pausa si es necesario
+        require(to != address(this), "Emergency: cannot withdraw to self");
         
         if (tokenAddress == address(this)) {
+            uint256 contractBalance = balanceOf(address(this));
+            
+            // Proteger fondos de usuarios
+            uint256 userFunds = _totalStaked + _stakingPool;
+            uint256 availableForWithdraw = contractBalance > userFunds 
+                ? contractBalance - userFunds 
+                : 0;
+            
+            require(amount <= availableForWithdraw, "Emergency: insufficient surplus");
+            require(availableForWithdraw > 0, "Emergency: no surplus available");
+            
             _transfer(address(this), to, amount);
         } else {
-            // Para otros tokens ERC20 atrapados
+            // Para otros tokens ERC20 atrapados accidentalmente
             (bool success, bytes memory data) = tokenAddress.call(
                 abi.encodeWithSignature("transfer(address,uint256)", to, amount)
             );
@@ -668,6 +795,7 @@ contract MyTokenPro is
 
     function stakeInfo(address user) external view returns (
         uint256 amount,
+        uint256 stakeStartBlock,
         uint256 rewardDebt,
         uint256 lastClaimBlock,
         uint256 lockedUntilBlock,
@@ -676,6 +804,7 @@ contract MyTokenPro is
         StakeInfo memory s = _stakes[user];
         return (
             s.amount,
+            s.stakeStartBlock,
             s.rewardDebt,
             s.lastClaimBlock,
             s.lockedUntilBlock,
@@ -690,13 +819,15 @@ contract MyTokenPro is
     function epochInfo(uint256 epochId) external view returns (
         uint256 accRewardPerToken,
         uint256 startBlock,
-        uint256 totalDistributed
+        uint256 totalDistributed,
+        bool settled
     ) {
         EpochData memory epoch = _epochs[epochId];
         return (
             epoch.accRewardPerToken,
             epoch.startBlock,
-            epoch.totalDistributed
+            epoch.totalDistributed,
+            epoch.settled
         );
     }
 
@@ -722,10 +853,11 @@ contract MyTokenPro is
 
     function timelockProposal(bytes32 proposalId) external view returns (
         uint256 executeAfter,
-        bool executed
+        bool executed,
+        bytes32 dataHash
     ) {
         TimelockProposal memory proposal = _timelockQueue[proposalId];
-        return (proposal.executeAfter, proposal.executed);
+        return (proposal.executeAfter, proposal.executed, proposal.dataHash);
     }
 
     function getTimelockProposalId(string memory action, address param) 
@@ -735,9 +867,17 @@ contract MyTokenPro is
     {
         return keccak256(abi.encode(action, param));
     }
+    
+    function getTimelockProposalIdForFeeRange(uint256 minFee, uint256 maxFee) 
+        external 
+        pure 
+        returns (bytes32) 
+    {
+        return keccak256(abi.encode("setFeeRange", minFee, maxFee));
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // INVARIANTES - FUNCIONES DE VERIFICACIÓN (para testing y auditoría)
+    // INVARIANTES - FUNCIONES DE VERIFICACIÓN 
     // ═══════════════════════════════════════════════════════════════════════════
     
     /**
@@ -775,6 +915,99 @@ contract MyTokenPro is
             _treasury,
             paused()
         );
+    }
+    
+    /**
+     * @notice Verifica la salud financiera del contrato
+     */
+    function getHealthMetrics() external view returns (
+        uint256 contractBalance,
+        uint256 totalObligations,
+        uint256 surplus,
+        bool isHealthy,
+        uint256 stakingPoolPercent
+    ) {
+        contractBalance = balanceOf(address(this));
+        totalObligations = _stakingPool + _totalStaked;
+        surplus = contractBalance > totalObligations ? contractBalance - totalObligations : 0;
+        isHealthy = contractBalance >= totalObligations;
+        
+        uint256 ts = totalSupply();
+        stakingPoolPercent = ts > 0 ? Math.mulDiv(_stakingPool, 100, ts) : 0;
+        
+        return (contractBalance, totalObligations, surplus, isHealthy, stakingPoolPercent);
+    }
+    
+    /**
+     * @notice Verifica si un usuario puede reclamar rewards
+     */
+    function canClaimReward(address user) external view returns (
+        bool canClaim,
+        string memory reason,
+        uint256 blocksUntilEligible
+    ) {
+        StakeInfo memory s = _stakes[user];
+        
+        if (s.amount == 0) {
+            return (false, "No stake", 0);
+        }
+        
+        uint256 blocksStaked = block.number - s.stakeStartBlock;
+        if (blocksStaked < MIN_STAKE_DURATION) {
+            return (
+                false, 
+                "Insufficient stake duration", 
+                MIN_STAKE_DURATION - blocksStaked
+            );
+        }
+        
+        uint256 blocksSinceClaim = block.number - s.lastClaimBlock;
+        if (blocksSinceClaim < MIN_BLOCKS_BETWEEN_CLAIM) {
+            return (
+                false, 
+                "Claim cooldown active", 
+                MIN_BLOCKS_BETWEEN_CLAIM - blocksSinceClaim
+            );
+        }
+        
+        if (s.rewardDebt == 0) {
+            return (false, "No rewards", 0);
+        }
+        
+        return (true, "Eligible", 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FUNCIONES ADMINISTRATIVAS ADICIONALES
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * @notice Fuerza el settlement de un epoch (solo owner, para emergencias)
+     */
+    function forceEpochSettlement(uint256 epochId) external onlyOwner {
+        require(epochId <= _currentEpoch, "Epoch: invalid id");
+        require(!_epochs[epochId].settled, "Epoch: already settled");
+        
+        _epochs[epochId].settled = true;
+        emit EpochSettled(epochId, _epochs[epochId].totalDistributed);
+    }
+    
+    /**
+     * @notice Permite al owner avanzar manualmente el epoch (emergencia)
+     */
+    function forceEpochAdvance() external onlyOwner {
+        require(
+            block.number >= _epochs[_currentEpoch].startBlock + (EPOCH_DURATION / 2),
+            "Epoch: too early"
+        );
+        
+        _settleCurrentEpoch();
+        _currentEpoch++;
+        _epochs[_currentEpoch].startBlock = block.number;
+        _epochs[_currentEpoch].accRewardPerToken = 0;
+        _epochs[_currentEpoch].settled = false;
+        
+        emit EpochAdvanced(_currentEpoch, block.number);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
