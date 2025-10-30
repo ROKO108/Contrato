@@ -125,16 +125,28 @@ constructor(
         FEE_MAX = maxFee;
     }
 
+    // Reemplazo de _updateFee
     function _updateFee() internal {
-        if (totalSupply() == 0) return;
-        uint256 poolRatio = (_stakingPool * 1e18) / totalSupply();
-        uint256 dynamicFee = FEE_MAX - ((FEE_MAX - FEE_MIN) * poolRatio) / 1e18;
+        uint256 ts = totalSupply();
+        if (ts == 0) return;
+        // poolRatio en fixed-point 1e18, con redondeo al entero más cercano
+        // poolRatio = round((_stakingPool * 1e18) / ts)
+        uint256 numerator = _stakingPool * 1e18;
+        uint256 poolRatio = (numerator + ts / 2) / ts; // redondeo
+        // dynamicFee con cálculo seguro
+        uint256 delta = (FEE_MAX - FEE_MIN);
+        uint256 dynamicFee = FEE_MAX;
+        // dynamicFee = FEE_MAX - delta * poolRatio / 1e18
+        uint256 sub = (delta * poolRatio + 1e18 / 2) / 1e18; // redondeo
+        if (sub <= FEE_MAX) dynamicFee = FEE_MAX - sub;
         if (dynamicFee < FEE_MIN) dynamicFee = FEE_MIN;
         if (dynamicFee > FEE_MAX) dynamicFee = FEE_MAX;
         feePercent = dynamicFee;
         emit FeePercentUpdated(dynamicFee);
     }
 
+
+    // Reemplazo de _update (parte fee) — usar redondeo y mínimo 1 wei de fee si se desea
     function _update(
         address from,
         address to,
@@ -152,29 +164,42 @@ constructor(
         ) {
             super._update(from, to, amount);
         } else {
-            uint256 fee = (amount * feePercent) / FEE_BASE;
-            uint256 burnAmount = (fee * BURN_PERCENT) / 100;
-            uint256 stakingAmount = (fee * STAKING_PERCENT) / 100;
-            uint256 treasuryAmount = fee - burnAmount - stakingAmount;
-            uint256 amountAfterFee = amount - fee;
+            // fee = round((amount * feePercent) / FEE_BASE)
+            uint256 rawFeeNumer = amount * feePercent;
+            uint256 fee = (rawFeeNumer + FEE_BASE / 2) / FEE_BASE; // redondeo
+            // Si quieres asegurar que siempre haya alguna comisión mínima cuando amount>0:
+            // if (amount > 0 && fee == 0) fee = 1;
 
-            if (burnAmount > 0) _burn(from, burnAmount);
-            if (stakingAmount > 0) _stakingPool += stakingAmount;
-            if (treasuryAmount > 0)
-                super._update(from, _treasury, treasuryAmount);
-            super._update(from, to, amountAfterFee);
+            if (fee > 0) {
+                uint256 burnAmount = (fee * BURN_PERCENT + 50) / 100; // redondeo
+                uint256 stakingAmount = (fee * STAKING_PERCENT + 50) / 100;
+                uint256 treasuryAmount = fee - burnAmount - stakingAmount;
+                uint256 amountAfterFee = amount - fee;
 
-            _updateRewards(from);
-            _updateRewards(to);
-            emit FeeApplied(
-                from,
-                fee,
-                burnAmount,
-                stakingAmount,
-                treasuryAmount
-            );
+                if (burnAmount > 0) _burn(from, burnAmount);
+                if (stakingAmount > 0) _stakingPool += stakingAmount;
+                if (treasuryAmount > 0)
+                    super._update(from, _treasury, treasuryAmount);
+                super._update(from, to, amountAfterFee);
+
+                _updateRewards(from);
+                _updateRewards(to);
+                emit FeeApplied(
+                    from,
+                    fee,
+                    burnAmount,
+                    stakingAmount,
+                    treasuryAmount
+                );
+            } else {
+                // fee == 0: transfer sin comisiones
+                super._update(from, to, amount);
+                _updateRewards(from);
+                _updateRewards(to);
+            }
         }
     }
+
 
     function stake(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "Zero amount");
@@ -199,6 +224,7 @@ constructor(
         emit Unstaked(msg.sender, amount);
     }
 
+    // Reemplazo de claimReward: manejo de maxClaim y evitar maxClaim == 0 bloqueante
     function claimReward() external nonReentrant whenNotPaused {
         StakeInfo storage s = _stakes[msg.sender];
         require(
@@ -208,9 +234,17 @@ constructor(
         _updateRewards(msg.sender);
         uint256 reward = s.rewardDebt;
         require(reward > 0, "No reward");
-        uint256 maxClaim = (_stakingPool * MAX_CLAIM_PERCENT) / 100;
+
+        // MAX_CLAIM_PERCENT aplicado con redondeo y con fallback a 1 si _stakingPool>0
+        uint256 maxClaim = (_stakingPool * MAX_CLAIM_PERCENT + 50) / 100;
+        if (_stakingPool > 0 && maxClaim == 0) {
+            // pequeño pool -> permitir al menos 1 token como tope
+            maxClaim = 1;
+        }
         if (reward > maxClaim) reward = maxClaim;
         if (reward > _stakingPool) reward = _stakingPool;
+        require(reward > 0, "Reward too small");
+
         _stakingPool -= reward;
         s.rewardDebt -= reward;
         s.lastClaimBlock = block.number;
@@ -218,16 +252,29 @@ constructor(
         emit RewardClaimed(msg.sender, reward);
     }
 
+
+    // Reemplazo de _updateRewards: usar acumulador incremental y evitar truncamiento
     function _updateRewards(address user) internal {
         if (_totalStaked == 0 || _stakingPool == 0) return;
-        _accRewardPerToken = (_stakingPool * 1e18) / _totalStaked;
+
+        // mejor usar incremento: deltaAcc = (stakingPool * 1e18) / totalStaked
+        // pero NO reasignar _accRewardPerToken si ya hay un acumulado:
+        uint256 delta = (_stakingPool * 1e18 + _totalStaked / 2) / _totalStaked; // redondeo
+        // Evitar duplicar la misma _stakingPool: si _stakingPool ya fue distribuido parcialmente
+        // (diseño: si _accRewardPerToken debe ser acumulativo, sumar delta)
+        _accRewardPerToken += delta;
+
         StakeInfo storage s = _stakes[user];
         if (s.amount > 0) {
-            uint256 pending = (s.amount * _accRewardPerToken) / 1e18 -
-                s.rewardDebt;
-            s.rewardDebt += pending;
+            // pending = round((s.amount * _accRewardPerToken) / 1e18) - s.rewardDebt
+            uint256 pendingGross = (s.amount * _accRewardPerToken + 1e18 / 2) / 1e18;
+            if (pendingGross > s.rewardDebt) {
+                uint256 pending = pendingGross - s.rewardDebt;
+                s.rewardDebt += pending;
+            }
         }
     }
+
 
     function stakedBalance(address user) external view returns (uint256) {
         return _stakes[user].amount;
