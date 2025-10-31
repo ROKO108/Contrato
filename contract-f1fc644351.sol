@@ -47,7 +47,7 @@ contract MyTokenPro is
     
     // Protecciones anti-manipulación
     uint256 public constant FEE_UPDATE_COOLDOWN = 100;
-    uint256 public constant TIMELOCK_DURATION = 6400; // ~1 día en bloques
+    uint256 public constant TIMELOCK_DURATION = 44800; // ~7 día en bloques
     uint256 public constant MAX_EXCLUDED_ACCOUNTS = 100;
     uint256 public constant EPOCH_DURATION = 100000; // Reset acumulador cada X bloques
     
