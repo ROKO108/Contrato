@@ -1,18 +1,25 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
-import "@openzeppelin/contracts/interfaces/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/extensions/draft-ERC20Permit.sol";
-import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
-import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Pausable.sol";
-import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Votes.sol";
-import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Snapshot.sol";
-import "@openzeppelin/contracts/access/Ownable2Step.sol";
-import "@openzeppelin/contracts/utils/Nonces.sol";
+import "./extensions/TokenBurn.sol";
+import "./extensions/TokenPause.sol"; // Added for ERC20Pausable
+import "./extensions/TokenPermit.sol"; // Added for ERC20Permit
+import "./extensions/TokenSnapshot.sol"; // Added for ERC20Snapshot
+import "./extensions/TokenVotes.sol"; // Added for ERC20Votes
+import "./token/TokenSupply.sol"; // Added for MAX_MINT_PER_CALL, MAX_SUPPLY, _minted
 
-import "../modules/fees/FeeProcessor.sol";
+import "./integration/SecurityIntegration.sol";
+import "./integration/StakingIntegration.sol";
+import "./integration/FeeIntegration.sol";
+import "./integration/GovernanceIntegration.sol";
+import "./transfer/TransferProcessor.sol";
+import "./transfer/TransferValidation.sol";
+import "./events/CoreEvents.sol";
+import "./events/SecurityEvents.sol";
+
+// Import module contracts
 import "../modules/fees/FeeExclusions.sol";
+import "../modules/fees/FeeProcessor.sol";
 import "../modules/staking/StakeManager.sol";
 import "../modules/staking/RewardManager.sol";
 import "../modules/governance/TimelockManager.sol";
@@ -22,20 +29,26 @@ import "../modules/security/PauseModule.sol";
 import "../modules/security/SecurityLimits.sol";
 
 /**
- * @title MyTokenPro - Core contract that composes modules
+ * @title MyTokenPro - Core contract that integrates all modules
+ * @notice Main entry point for the token system that coordinates all modular functionality
  */
-abstract contract MyTokenPro is
-    ERC20,
-    ERC20Permit,
-    ERC20Burnable,
-    ERC20Pausable,
-    ERC20Votes,
-    ERC20Snapshot,
-    Ownable2Step
+contract MyTokenPro is
+    TokenBurn,
+    TokenPause, // Explicitly inherit TokenPause
+    TokenPermit, // Explicitly inherit TokenPermit
+    TokenSnapshot, // Explicitly inherit TokenSnapshot
+    TokenVotes, // Explicitly inherit TokenVotes
+    TokenSupply // Explicitly inherit TokenSupply
 {
-    // Módulos
-    FeeProcessor public immutable feeProcessor;
+    // Module integrations
+    SecurityIntegration public immutable securityIntegration;
+    StakingIntegration public immutable stakingIntegration;
+    FeeIntegration public immutable feeIntegration;
+    GovernanceIntegration public immutable governanceIntegration;
+
+    // Module instances (declared as state variables)
     FeeExclusions public immutable feeExclusions;
+    FeeProcessor public immutable feeProcessor;
     StakeManager public immutable stakeManager;
     RewardManager public immutable rewardManager;
     TimelockManager public immutable timelockManager;
@@ -43,13 +56,8 @@ abstract contract MyTokenPro is
     EmergencyModule public immutable emergencyModule;
     PauseModule public immutable pauseModule;
     SecurityLimits public immutable securityLimits;
-
-    // Constantes principales
-    uint256 private immutable MAX_SUPPLY = 1_000_000_000 * 1e18;
-    uint256 public constant MAX_MINT_PER_CALL = 10_000_000 * 1e18;
-
-    // Core state
-    uint256 private _minted;
+    TransferProcessor public immutable transferProcessor; // Added
+    TransferValidation public immutable transferValidation; // Added
 
     // Events that are core-specific
     event Mint(address indexed to, uint256 amount, uint256 totalMinted);
@@ -69,13 +77,10 @@ abstract contract MyTokenPro is
         address initialOwner
     )
         ERC20("MyTokenPro", "MTP")
-        ERC20Permit("MyTokenPro")
         Ownable2Step(initialOwner)
     {
-        // Inicializar módulos en orden con parámetros correctos
         // Crear módulos - la mayoría estarán gobernados por `initialOwner`
         feeExclusions = new FeeExclusions(initialOwner);
-        // FeeProcessor necesita treasury, exclusions contract y rangos iniciales
         feeProcessor = new FeeProcessor(
             address(this),
             address(feeExclusions),
@@ -84,16 +89,46 @@ abstract contract MyTokenPro is
             50
         );
 
-        // Staking & rewards
         stakeManager = new StakeManager(address(this));
         rewardManager = new RewardManager(address(this), address(stakeManager));
 
-        // Gobernanza y seguridad
         timelockManager = new TimelockManager(initialOwner);
         snapshotManager = new SnapshotManager(address(this));
         emergencyModule = new EmergencyModule(initialOwner);
         pauseModule = new PauseModule(initialOwner, address(this));
         securityLimits = new SecurityLimits(address(this));
+
+        // Initialize transfer modules
+        transferProcessor = new TransferProcessor(
+            address(feeIntegration), // Pass feeIntegration for fee processing
+            address(securityIntegration) // Pass securityIntegration for security checks
+        );
+        transferValidation = new TransferValidation(
+            address(securityIntegration), // Pass securityIntegration for security checks
+            address(pauseModule) // Pass pauseModule for pause checks
+        );
+
+        // Inicializar módulos de integración
+        securityIntegration = new SecurityIntegration(
+            address(emergencyModule),
+            address(pauseModule),
+            address(securityLimits)
+        );
+        // Authorize TransferProcessor to call validateTransfer on SecurityIntegration
+        // This is necessary because TransferProcessor now delegates security checks to SecurityIntegration.
+        securityIntegration.authorizeModule(address(transferProcessor), securityIntegration.SECURITY_LIMIT_ROLE());
+        stakingIntegration = new StakingIntegration(
+            address(stakeManager),
+            address(rewardManager)
+        );
+        feeIntegration = new FeeIntegration(
+            address(feeProcessor),
+            address(feeExclusions)
+        );
+        governanceIntegration = new GovernanceIntegration(
+            address(timelockManager),
+            address(snapshotManager)
+        );
     }
 
     // --------------------------------------------------
@@ -104,24 +139,15 @@ abstract contract MyTokenPro is
         address from,
         address to,
         uint256 amount
-    ) internal virtual override(ERC20, ERC20Pausable, ERC20Votes) {
-        // Check pause and security limits first
-        require(!pauseModule.isPaused(), "Token: paused");
-        require(
-            securityLimits.checkTransferLimit(from, amount),
-            "Token: limits exceeded"
-        );
+    ) internal virtual override(ERC20, ERC20Pausable, ERC20Votes, ERC20Snapshot) {
+        // Delegate validation to TransferValidation module
+        transferValidation.validateTransfer(from, to, amount);
 
-        if (from != address(0) && to != address(0)) {
-            // Calculate and apply fee for regular transfers
-            uint256 amountAfterFee = feeProcessor.processFee(from, to, amount);
-            if (amountAfterFee < amount) {
-                amount = amountAfterFee;
-            }
-        }
+        // Delegate processing to TransferProcessor module
+        uint256 amountAfterProcessing = transferProcessor.processTransfer(from, to, amount);
 
-        // Let parent contracts handle standard updates
-        super._update(from, to, amount);
+        // Let parent contracts handle standard updates with the processed amount
+        super._update(from, to, amountAfterProcessing);
     }
 
     // Snapshot/pause hooks handled via ERC20's newer _update mechanism and
