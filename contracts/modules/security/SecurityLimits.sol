@@ -25,7 +25,7 @@ contract SecurityLimits {
         _token = IERC20(token_);
     }
 
-    function checkTransferLimit(
+function checkTransferLimit(
         address from,
         uint256 amount
     ) external returns (bool) {
@@ -34,11 +34,17 @@ contract SecurityLimits {
             return false;
         }
 
+        uint256 totalSupply = _token.totalSupply();
+        require(totalSupply > 0, "Security: zero supply");
+        
         uint256 maxTransfer = MathUtils.calculateRatio(
-            _token.totalSupply(),
+            totalSupply,
             MAX_TRANSFER_PERCENT,
             100
         );
+        
+        // Additional safety check
+        require(maxTransfer > 0, "Security: zero max transfer");
 
         if (amount > maxTransfer) {
             emit SecurityLimitHit("MaxTransfer", from, amount);

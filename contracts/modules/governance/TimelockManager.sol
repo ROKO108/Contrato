@@ -85,15 +85,25 @@ contract TimelockManager is ITimelock, Ownable {
         );
     }
 
-    // Implementación mínima de setTreasury para cumplir la interfaz.
-    function setTreasury(address /* newTreasury */, bytes32 proposalId, bytes32 /* salt */) external override onlyOwner {
+// Implementación mínima de setTreasury para cumplir la interfaz.
+    function setTreasury(address newTreasury, bytes32 proposalId, bytes32 salt) external override onlyOwner {
+        require(newTreasury != address(0), "Timelock: zero address");
+        
         TimelockProposal storage proposal = _timelockQueue[proposalId];
         require(proposal.executeAfter > 0, "Not found");
         require(block.number >= proposal.executeAfter, "Too soon");
         require(!proposal.executed, "Already executed");
+        require(!proposal.revealed, "Already revealed");
 
+        // Validate the proposal hash
+        bytes32 expectedHash = keccak256(abi.encodePacked(newTreasury));
+        bytes32 computedHash = keccak256(abi.encodePacked(expectedHash, salt));
+        require(proposal.commitHash == computedHash, "Hash mismatch");
+
+        proposal.revealed = true;
         proposal.executed = true;
         proposal.lastTimelockExecution = block.number;
+        emit TimelockRevealed(proposalId, computedHash);
         emit TimelockExecuted(proposalId);
     }
 

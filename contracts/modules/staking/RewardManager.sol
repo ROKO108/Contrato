@@ -87,12 +87,23 @@ contract RewardManager is IRewards, ReentrancyGuard {
 
             totalReward = Math.min(totalReward, maxReward);
             
-            if (totalReward > 0) {
-                epoch.accRewardPerToken += MathUtils.calculateRatio(
+if (totalReward > 0) {
+                uint256 stakingBalance = _token.balanceOf(_stakingContract);
+                require(stakingBalance > 0, "Reward: no staking balance");
+                
+                uint256 rewardPerToken = MathUtils.calculateRatio(
                     totalReward,
                     REWARD_PRECISION,
-                    _token.balanceOf(_stakingContract)
+                    stakingBalance
                 );
+                
+                // Prevent overflow
+                require(epoch.accRewardPerToken <= type(uint256).max - rewardPerToken, "Reward: overflow");
+                
+                epoch.accRewardPerToken += rewardPerToken;
+                
+                // Prevent overflow in total distributed
+                require(epoch.totalDistributed <= type(uint256).max - totalReward, "Reward: total overflow");
                 epoch.totalDistributed += totalReward;
             }
         }

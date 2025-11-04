@@ -6,12 +6,14 @@ import "../../interfaces/IFeeProcessor.sol";
 import "../../libraries/MathUtils.sol";
 import "../../libraries/SafetyChecks.sol";
 import "./FeeExclusions.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 /**
  * @title FeeProcessor
  * @dev Procesamiento y distribución de fees
  */
-contract FeeProcessor is IFeeProcessor {
+contract FeeProcessor is IFeeProcessor, Ownable, ReentrancyGuard {
     using MathUtils for uint256;
 
     uint256 public constant FEE_BASE = 1000;
@@ -29,13 +31,14 @@ contract FeeProcessor is IFeeProcessor {
     address private immutable _treasury;
     FeeExclusions private immutable _exclusions;
 
-    constructor(
+constructor(
         address treasury_,
         address exclusionsContract,
         uint256 initialFeePercent,
         uint256 minFee,
-        uint256 maxFee
-    ) {
+        uint256 maxFee,
+        address initialOwner
+    ) Ownable(initialOwner) {
         SafetyChecks.validateAddress(treasury_);
         SafetyChecks.validateAddress(exclusionsContract);
         
@@ -61,8 +64,10 @@ contract FeeProcessor is IFeeProcessor {
         emit FeeExclusionSet(account, excluded);
     }
 
-    function setFeeRange(uint256 minFee, uint256 maxFee, bytes32 /* proposalId */, bytes32 /* salt */) external override {
+function setFeeRange(uint256 minFee, uint256 maxFee, bytes32 /* proposalId */, bytes32 /* salt */) external override onlyOwner {
         // Aplicar cambios directamente (in a real setup, this should be timelocked)
+        require(minFee < maxFee, "Fee: min must be less than max");
+        require(minFee >= 0 && maxFee <= FEE_BASE, "Fee: invalid range");
         FEE_MIN = minFee;
         FEE_MAX = maxFee;
         emit FeeRangeUpdated(minFee, maxFee, block.timestamp);
@@ -72,7 +77,7 @@ function processFee(
         address from,
         address to,
         uint256 amount
-    ) external returns (uint256 amountAfterFee) {
+    ) external nonReentrant returns (uint256 amountAfterFee) {
         // Early exit for excluded addresses (gas optimization)
         if (_exclusions.isExcludedFromFees(from) || 
             _exclusions.isExcludedFromFees(to)) {

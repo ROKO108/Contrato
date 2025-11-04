@@ -19,14 +19,16 @@ contract TransferProcessor is Context {
         securityModule = _securityModule;
     }
     
-    function processTransfer(
+function processTransfer(
         address from,
         address to,
         uint256 amount
     ) external returns (uint256) {
+        // Basic input validation
+        require(to != address(0), "TransferProcessor: zero address");
+        require(amount > 0, "TransferProcessor: zero amount");
+        
         // Security checks - delegate to SecurityIntegration
-        // The zero address check is handled by TransferValidation, which is called before this.
-        // We rely on TransferValidation for basic checks, and SecurityIntegration for complex ones.
         require(
             ISecurityIntegration(securityModule).validateTransfer(from, to, amount),
             "TransferProcessor: security validation failed"

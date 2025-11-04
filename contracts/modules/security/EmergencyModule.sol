@@ -46,7 +46,6 @@ uint256 public constant EMERGENCY_COOLDOWN = 1 hours;
             block.timestamp >= lastEmergencyCall + EMERGENCY_COOLDOWN,
             "Emergency cooldown not met"
         );
-        lastEmergencyCall = block.timestamp;
 
         if (tokenAddress == address(this)) {
             uint256 contractBalance = IERC20(tokenAddress).balanceOf(address(this));
@@ -55,7 +54,10 @@ uint256 public constant EMERGENCY_COOLDOWN = 1 hours;
                                          contractBalance - userFunds : 0;
 
             require(amount <= availableForWithdraw, "Insufficient surplus");
-            require(availableForWithdraw > 0, "No surplus available");
+require(availableForWithdraw > 0, "No surplus available");
+
+            // Update state before external call (Checks-Effects-Interactions pattern)
+            lastEmergencyCall = block.timestamp;
 
             bool success = IERC20(tokenAddress).transfer(to, amount);
             require(success, "Transfer failed");

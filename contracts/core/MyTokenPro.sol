@@ -93,9 +93,10 @@ contract MyTokenPro is
         _;
     }
 
-    constructor(address initialOwner)
+constructor(address initialOwner)
         ERC20("MyTokenPro", "MTP"), Ownable2Step(initialOwner)
     {
+        require(initialOwner != address(0), "Token: zero owner");
         _initBaseModules(initialOwner);
         _initIntegrations();
         _initTransferModules();
@@ -106,9 +107,9 @@ contract MyTokenPro is
     // Internal initialization helpers
     // ================================================================
 
-    function _initBaseModules(address initialOwner) private {
+function _initBaseModules(address initialOwner) private {
         feeExclusions   = new FeeExclusions(initialOwner);
-        feeProcessor    = new FeeProcessor(address(this), address(feeExclusions), 25, 5, 50);
+        feeProcessor    = new FeeProcessor(address(this), address(feeExclusions), 25, 5, 50, initialOwner);
 
         stakeManager    = new StakeManager(address(this));
         rewardManager   = new RewardManager(address(this), address(stakeManager));
@@ -212,9 +213,17 @@ function _authorizeModules() private {
     // Implementación de interfaces de módulos
     // --------------------------------------------------
     function mint(address to, uint256 amount) external onlyModule(address(rewardManager)) {
+        require(to != address(0), "Token: zero address");
+        require(amount > 0, "Token: zero amount");
         require(amount <= MAX_MINT_PER_CALL, "Token: max mint exceeded");
         require(_minted + amount <= MAX_SUPPLY, "Token: max supply exceeded");
-        unchecked { _minted += amount; }
+        
+        // Prevent overflow
+        unchecked { 
+            _minted += amount; 
+            require(_minted <= MAX_SUPPLY, "Token: overflow");
+        }
+        
         _mint(to, amount);
         emit Mint(to, amount, _minted);
     }
