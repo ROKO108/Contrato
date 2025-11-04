@@ -49,18 +49,30 @@ import "../modules/governance/SnapshotManager.sol";
 // Security Modules
 import "../modules/security/EmergencyModule.sol";
 import "../modules/security/PauseModule.sol";
-import "../../modules/security/SecurityLimits.sol";
+import "../modules/security/SecurityLimits.sol";
+
+// OpenZeppelin imports
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Votes.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Snapshot.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/draft-ERC20Permit.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
 
 /**
  * @title MyTokenPro - Core contract that integrates all modules
  * @notice Main entry point for the token system that coordinates all modular functionality
+ * @dev FIXED: Proper initialization of all inherited contracts
  */
-contract MyTokenPro is
-    TokenBurn,
-    TokenPause,
-    TokenPermit,
-    TokenSnapshot,
-    TokenVotes,
+contract MyTokenPro is 
+    ERC20("MyTokenPro", "MTP"),
+    Ownable2Step,
+    ERC20Burnable,
+    ERC20Votes,
+    ERC20Snapshot,
+    ERC20Permit("MyTokenPro"),
+    Pausable,
     TokenSupply
 {
     // Module integrations
@@ -93,13 +105,19 @@ contract MyTokenPro is
         _;
     }
 
-constructor(address initialOwner)
-        ERC20("MyTokenPro", "MTP"), Ownable2Step(initialOwner)
+    constructor(address initialOwner) 
+        ERC20("MyTokenPro", "MTP"),
+        Ownable2Step(initialOwner),
+        ERC20Permit("MyTokenPro")
     {
         require(initialOwner != address(0), "Token: zero owner");
+        
+        // Initialize all modules first
         _initBaseModules(initialOwner);
         _initIntegrations();
         _initTransferModules();
+        
+        // Authorize modules after all initialization
         _authorizeModules();
     }
 
@@ -107,7 +125,7 @@ constructor(address initialOwner)
     // Internal initialization helpers
     // ================================================================
 
-function _initBaseModules(address initialOwner) private {
+    function _initBaseModules(address initialOwner) private {
         feeExclusions   = new FeeExclusions(initialOwner);
         feeProcessor    = new FeeProcessor(address(this), address(feeExclusions), 25, 5, 50, initialOwner);
 
@@ -156,7 +174,7 @@ function _initBaseModules(address initialOwner) private {
         );
     }
 
-function _authorizeModules() private {
+    function _authorizeModules() private {
         // Standardized module authorization pattern
         _authorizeSecurityModules();
         _authorizeFeeModules();
@@ -196,62 +214,55 @@ function _authorizeModules() private {
         );
     }
 
-    // --------------------------------------------------
-    // Hooks y delegación a módulos
-    // --------------------------------------------------
+    // ================================================================
+    // Hooks and delegation to modules
+    // ================================================================
+    
     function _update(
         address from,
         address to,
         uint256 amount
     ) internal virtual override(ERC20, ERC20Pausable, ERC20Votes, ERC20Snapshot) {
+        require(!paused(), "Token: contract is paused");
+        
         transferValidation.validateTransfer(from, to, amount);
         uint256 amountAfterProcessing = transferProcessor.processTransfer(from, to, amount);
         super._update(from, to, amountAfterProcessing);
     }
 
-    // --------------------------------------------------
-    // Implementación de interfaces de módulos
-    // --------------------------------------------------
-    function mint(address to, uint256 amount) external onlyModule(address(rewardManager)) {
-        require(to != address(0), "Token: zero address");
-        require(amount > 0, "Token: zero amount");
-        require(amount <= MAX_MINT_PER_CALL, "Token: max mint exceeded");
-        require(_minted + amount <= MAX_SUPPLY, "Token: max supply exceeded");
-        
-        // Prevent overflow
-        unchecked { 
-            _minted += amount; 
-            require(_minted <= MAX_SUPPLY, "Token: overflow");
-        }
-        
-        _mint(to, amount);
-        emit Mint(to, amount, _minted);
-    }
+    // ================================================================
+    // Module interface implementations
+    // ================================================================
+    
+    // MINT FUNCTION REMOVED - SECURITY FIX
+    // Rewards should be distributed from existing token supply, not minted
+    // This prevents unlimited inflation and protects token holder value
 
     function pause() external {
         require(msg.sender == address(emergencyModule), "Token: only emergency module");
-        pauseModule.pause();
+        _pause();
     }
 
     function unpause() external {
         require(msg.sender == address(emergencyModule), "Token: only emergency module");
-        pauseModule.unpause();
+        _unpause();
     }
 
     function createSnapshot() external returns (uint256) {
         require(msg.sender == address(snapshotManager), "Token: only snapshot manager");
-        return snapshotManager.createSnapshot();
+        return _snapshot();
     }
 
-    // --------------------------------------------------
-    // Funciones públicas
-    // --------------------------------------------------
+    // ================================================================
+    // Public functions
+    // ================================================================
+    
     function burn(uint256 amount) public virtual override {
         super.burn(amount);
     }
 
     function snapshot() external returns (uint256) {
-        return snapshotManager.createSnapshot();
+        return _snapshot();
     }
 
     function stake(uint256 amount) external {
@@ -289,18 +300,10 @@ function _authorizeModules() private {
         return true;
     }
 
-    function nonces(address owner)
-        public
-        view
-        override(ERC20Permit, Nonces)
-        returns (uint256)
-    {
-        return super.nonces(owner);
-    }
-
-    // --------------------------------------------------
-    // Getters auxiliares
-    // --------------------------------------------------
+    // ================================================================
+    // View functions
+    // ================================================================
+    
     function stakingPool() external view returns (uint256) {
         return stakeManager.stakingPool();
     }
