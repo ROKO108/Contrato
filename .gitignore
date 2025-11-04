@@ -6,3 +6,4 @@ IMMEDIATE_FIXES_COORDINATION_PLAN.md
 SECURITY_FIX_STAKEMANAGER.md
 Agents.rar
 *.md
+/node_modules
