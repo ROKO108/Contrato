@@ -1,29 +1,52 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
+// ================================================================
+// Core Token Components
+// ================================================================
+import "./token/TokenSupply.sol"; // Added for MAX_MINT_PER_CALL, MAX_SUPPLY, _minted
 import "./extensions/TokenBurn.sol";
 import "./extensions/TokenPause.sol"; // Added for ERC20Pausable
 import "./extensions/TokenPermit.sol"; // Added for ERC20Permit
 import "./extensions/TokenSnapshot.sol"; // Added for ERC20Snapshot
 import "./extensions/TokenVotes.sol"; // Added for ERC20Votes
-import "./token/TokenSupply.sol"; // Added for MAX_MINT_PER_CALL, MAX_SUPPLY, _minted
 
+// ================================================================
+// Transfer Management
+// ================================================================
+import "./transfer/TransferProcessor.sol";
+import "./transfer/TransferValidation.sol";
+
+// ================================================================
+// Integration Contracts
+// ================================================================
 import "./integration/SecurityIntegration.sol";
 import "./integration/StakingIntegration.sol";
 import "./integration/FeeIntegration.sol";
 import "./integration/GovernanceIntegration.sol";
-import "./transfer/TransferProcessor.sol";
-import "./transfer/TransferValidation.sol";
+
+// ================================================================
+// Event Definitions
+// ================================================================
 import "./events/CoreEvents.sol";
 import "./events/SecurityEvents.sol";
 
-// Import module contracts
+// ================================================================
+// Module Contracts
+// ================================================================
+// Fee Modules
 import "../modules/fees/FeeExclusions.sol";
 import "../modules/fees/FeeProcessor.sol";
+
+// Staking Modules
 import "../modules/staking/StakeManager.sol";
 import "../modules/staking/RewardManager.sol";
+
+// Governance Modules
 import "../modules/governance/TimelockManager.sol";
 import "../modules/governance/SnapshotManager.sol";
+
+// Security Modules
 import "../modules/security/EmergencyModule.sol";
 import "../modules/security/PauseModule.sol";
 import "../modules/security/SecurityLimits.sol";
