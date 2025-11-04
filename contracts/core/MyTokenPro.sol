@@ -49,7 +49,7 @@ import "../modules/governance/SnapshotManager.sol";
 // Security Modules
 import "../modules/security/EmergencyModule.sol";
 import "../modules/security/PauseModule.sol";
-import "../modules/security/SecurityLimits.sol";
+import "../../modules/security/SecurityLimits.sol";
 
 /**
  * @title MyTokenPro - Core contract that integrates all modules
@@ -88,9 +88,13 @@ contract MyTokenPro is
     event SecurityLimitHit(string limitType, address indexed user, uint256 amount);
     event AntiFlashLoanTriggered(address indexed user, uint256 blocksStaked);
 
+    modifier onlyModule(address _module) {
+        require(msg.sender == _module, "Token: unauthorized module");
+        _;
+    }
+
     constructor(address initialOwner)
-        ERC20("MyTokenPro", "MTP")
-        Ownable2Step(initialOwner)
+        ERC20("MyTokenPro", "MTP"), Ownable2Step(initialOwner)
     {
         _initBaseModules(initialOwner);
         _initIntegrations();
@@ -151,10 +155,43 @@ contract MyTokenPro is
         );
     }
 
-    function _authorizeModules() private {
+function _authorizeModules() private {
+        // Standardized module authorization pattern
+        _authorizeSecurityModules();
+        _authorizeFeeModules();
+        _authorizeStakingModules();
+        _authorizeGovernanceModules();
+    }
+    
+    function _authorizeSecurityModules() private {
         securityIntegration.authorizeModule(
             address(transferProcessor),
             securityIntegration.SECURITY_LIMIT_ROLE()
+        );
+        securityIntegration.authorizeModule(
+            address(transferValidation),
+            securityIntegration.SECURITY_LIMIT_ROLE()
+        );
+    }
+    
+    function _authorizeFeeModules() private {
+        feeIntegration.authorizeModule(
+            address(transferProcessor),
+            feeIntegration.FEE_PROCESSOR_ROLE()
+        );
+    }
+    
+    function _authorizeStakingModules() private {
+        stakingIntegration.authorizeModule(
+            address(rewardManager),
+            stakingIntegration.REWARD_MANAGER_ROLE()
+        );
+    }
+    
+    function _authorizeGovernanceModules() private {
+        governanceIntegration.authorizeModule(
+            address(snapshotManager),
+            governanceIntegration.SNAPSHOT_MANAGER_ROLE()
         );
     }
 
@@ -174,8 +211,7 @@ contract MyTokenPro is
     // --------------------------------------------------
     // Implementación de interfaces de módulos
     // --------------------------------------------------
-    function mint(address to, uint256 amount) external {
-        require(msg.sender == address(rewardManager), "Token: only reward manager");
+    function mint(address to, uint256 amount) external onlyModule(address(rewardManager)) {
         require(amount <= MAX_MINT_PER_CALL, "Token: max mint exceeded");
         require(_minted + amount <= MAX_SUPPLY, "Token: max supply exceeded");
         unchecked { _minted += amount; }

@@ -12,7 +12,7 @@ contract TokenAccess is Ownable2Step {
     
     event FunctionRestricted(bytes4 indexed functionSig, bool restricted);
     
-    constructor(address initialOwner) Ownable2Step(initialOwner) {}
+    constructor(address initialOwner) Ownable2Step(initialOwner);
     
     modifier checkRestriction(bytes4 functionSig) {
         if (_restrictedFunctions[functionSig]) {
